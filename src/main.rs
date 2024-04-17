@@ -34,6 +34,7 @@ impl Categories {
         sender: mpsc::Sender<FetchRequest>,
         receiver: mpsc::Receiver<FetchResponse>,
     ) -> Self {
+        println!("Initializing Categories struct...");
         Categories {
             categories_hash: HashMap::new(),
             sender,
@@ -42,19 +43,19 @@ impl Categories {
     }
 
     pub async fn run(&mut self) {
-        let initial_url = "catagories.json".to_string();
-        // Send the initial fetch request
+        let initial_url = "categories.json".to_string();
+        println!("Sending initial fetch request for URL: {}", initial_url);
         self.sender
-            .send(FetchRequest {
-                url: initial_url.to_string(),
-            })
+            .send(FetchRequest { url: initial_url })
             .await
             .unwrap();
 
-        // Listen for responses
+        println!("Listening for responses...");
         while let Some(response) = self.receiver.recv().await {
+            println!("Received response: {:?}", response);
             match response {
                 FetchResponse::Categories(res) => {
+                    println!("Processing categories...");
                     self.categories_hash
                         .par_extend(res.categories.into_par_iter().map(|cat| {
                             (
@@ -65,6 +66,7 @@ impl Categories {
                                 },
                             )
                         }));
+                    println!("Categories processed and added.");
                 }
                 FetchResponse::FetchFailed { error } => {
                     eprintln!("Fetch failed: {}", error);
@@ -78,6 +80,7 @@ struct FetchRequest {
     url: String,
 }
 
+#[derive(Debug)]
 enum FetchResponse {
     Categories(CategoriesResponse),
     FetchFailed { error: String },
@@ -90,7 +93,7 @@ struct Fetcher {
     config: FetcherConfig,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FetcherConfig {
     base_url: String,
     language: String,
@@ -104,6 +107,7 @@ impl Fetcher {
         rx: mpsc::Receiver<FetchRequest>,
         tx: mpsc::Sender<FetchResponse>,
     ) -> Self {
+        println!("Initializing Fetcher with config: {:?}", config);
         Fetcher {
             client: Client::new(),
             rx,
@@ -113,19 +117,24 @@ impl Fetcher {
     }
 
     pub async fn run(&mut self) {
+        println!("Fetcher is running...");
         while let Some(request) = self.rx.recv().await {
+            println!("Received fetch request for URL: {}", request.url);
             let client = self.client.clone();
             let tx = self.tx.clone();
             let url = request.url.clone();
             let config = self.config.clone();
 
             task::spawn(async move {
+                println!("Spawning task to fetch data from URL: {}", url);
                 let response = Fetcher::fetch_data(&client, &config, &url).await;
                 match response {
                     Ok(data) => {
+                        println!("Data fetched successfully, parsing...");
                         if let Ok(categories_response) =
                             serde_json::from_str::<CategoriesResponse>(&data)
                         {
+                            println!("Data parsed successfully, sending response...");
                             if tx
                                 .send(FetchResponse::Categories(categories_response))
                                 .await
@@ -157,6 +166,7 @@ impl Fetcher {
         config: &FetcherConfig,
         url: &str,
     ) -> Result<String, ReqwestError> {
+        println!("Fetching data from endpoint: {}", url);
         let endpoint = format!(
             "{}/api/v2/help_center/{}/{}",
             config.base_url, config.language, url
@@ -166,11 +176,17 @@ impl Fetcher {
             .get(&endpoint)
             .basic_auth(&config.email, Some(&config.password))
             .send()
-            .await?
-            .json()
             .await?;
 
-        Ok(response)
+        if response.status().is_success() {
+            let data = response.text().await?;
+            println!("Data successfully retrieved from: {}", url);
+            Ok(data)
+        } else {
+            let err = format!("HTTP Error: {}", response.status());
+            println!("{}", err);
+            Err(ReqwestError::from(response.error_for_status().unwrap_err()))
+        }
     }
 }
 
@@ -189,9 +205,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Initialize Fetcher and Categories
-    let mut fetcher = Fetcher::new(config, fetcher_rx, categories_tx.clone());
+    let mut fetcher = Fetcher::new(config.clone(), fetcher_rx, categories_tx.clone());
     let mut categories = Categories::new(fetcher_tx, categories_rx);
 
+    println!("Starting Fetcher and Categories...");
     // Run Fetcher and Categories concurrently
     let fetcher_handle = tokio::spawn(async move {
         fetcher.run().await;
@@ -204,5 +221,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Wait for both tasks to complete
     let _ = tokio::try_join!(fetcher_handle, categories_handle)?;
 
+    println!("All tasks completed.");
     Ok(())
 }
