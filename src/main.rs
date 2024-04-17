@@ -1,10 +1,15 @@
 use rayon::prelude::*;
 use reqwest::{Client, Error as ReqwestError};
 use serde::Deserialize;
-use std::{collections::HashMap, env, error::Error};
-use tokio::{sync::mpsc, task};
+use std::{
+    collections::HashMap,
+    env,
+    error::Error,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+use tokio::{sync::broadcast, task};
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Category {
     id: i64,
     name: String,
@@ -17,24 +22,24 @@ struct CategoryDetail {
     url: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct CategoriesResponse {
     categories: Vec<Category>,
     next_page: Option<String>,
 }
 
+#[derive(Debug)]
 struct Categories {
     categories_hash: HashMap<i64, CategoryDetail>,
-    sender: mpsc::Sender<FetchRequest>,
-    receiver: mpsc::Receiver<FetchResponse>,
+    sender: broadcast::Sender<EventType>,
+    receiver: broadcast::Receiver<EventType>,
 }
 
 impl Categories {
     pub fn new(
-        sender: mpsc::Sender<FetchRequest>,
-        receiver: mpsc::Receiver<FetchResponse>,
+        sender: broadcast::Sender<EventType>,
+        receiver: broadcast::Receiver<EventType>,
     ) -> Self {
-        println!("Initializing Categories struct...");
         Categories {
             categories_hash: HashMap::new(),
             sender,
@@ -42,54 +47,75 @@ impl Categories {
         }
     }
 
+    pub fn print_categories(&self) {
+        for (id, category) in &self.categories_hash {
+            println!("ID: {}, Name: {}, URL: {}", id, category.name, category.url);
+        }
+    }
+
     pub async fn run(&mut self) {
         let initial_url = "categories.json".to_string();
-        println!("Sending initial fetch request for URL: {}", initial_url);
-        self.sender
-            .send(FetchRequest { url: initial_url })
-            .await
-            .unwrap();
+        let request = FetcherRequest::Categories(RequestUrl { url: initial_url });
 
-        println!("Listening for responses...");
-        while let Some(response) = self.receiver.recv().await {
-            println!("Received response: {:?}", response);
-            match response {
-                FetchResponse::Categories(res) => {
-                    println!("Processing categories...");
-                    self.categories_hash
-                        .par_extend(res.categories.into_par_iter().map(|cat| {
-                            (
-                                cat.id,
-                                CategoryDetail {
-                                    name: cat.name,
-                                    url: cat.url,
-                                },
-                            )
-                        }));
-                    println!("Categories processed and added.");
+        // Send the initial request
+        let _ = self.sender.send(EventType::FetcherRequest(request)); // Ignoring errors, which occur if no subscribers are present
+
+        // Receive responses
+        while let Ok(message) = self.receiver.recv().await {
+            if let EventType::FetcherResponse(response) = message {
+                match response {
+                    FetcherResponse::Categories(res) => {
+                        let _ = self.sender.send(EventType::IncrementActive);
+                        self.categories_hash
+                            .par_extend(res.categories.into_par_iter().map(|cat| {
+                                (
+                                    cat.id,
+                                    CategoryDetail {
+                                        name: cat.name,
+                                        url: cat.url,
+                                    },
+                                )
+                            }));
+                        let _ = self.sender.send(EventType::DecrementActive);
+                    }
+                    FetcherResponse::FetchFailed { error } => {
+                        eprintln!("Fetch failed: {}", error);
+                    }
                 }
-                FetchResponse::FetchFailed { error } => {
-                    eprintln!("Fetch failed: {}", error);
-                }
+                self.print_categories()
             }
         }
     }
 }
 
-struct FetchRequest {
+#[derive(Debug, Clone)]
+enum EventType {
+    FetcherRequest(FetcherRequest),
+    FetcherResponse(FetcherResponse),
+    IncrementActive,
+    DecrementActive,
+}
+
+#[derive(Debug, Clone)]
+enum FetcherRequest {
+    Categories(RequestUrl),
+}
+
+#[derive(Debug, Clone)]
+struct RequestUrl {
     url: String,
 }
 
-#[derive(Debug)]
-enum FetchResponse {
+#[derive(Debug, Clone)]
+enum FetcherResponse {
     Categories(CategoriesResponse),
     FetchFailed { error: String },
 }
 
 struct Fetcher {
     client: Client,
-    rx: mpsc::Receiver<FetchRequest>,
-    tx: mpsc::Sender<FetchResponse>,
+    sender: broadcast::Sender<EventType>,
+    receiver: broadcast::Receiver<EventType>,
     config: FetcherConfig,
 }
 
@@ -104,60 +130,62 @@ struct FetcherConfig {
 impl Fetcher {
     pub fn new(
         config: FetcherConfig,
-        rx: mpsc::Receiver<FetchRequest>,
-        tx: mpsc::Sender<FetchResponse>,
+        sender: broadcast::Sender<EventType>,
+        receiver: broadcast::Receiver<EventType>,
     ) -> Self {
-        println!("Initializing Fetcher with config: {:?}", config);
         Fetcher {
             client: Client::new(),
-            rx,
-            tx,
+            sender,
+            receiver,
             config,
         }
     }
 
     pub async fn run(&mut self) {
-        println!("Fetcher is running...");
-        while let Some(request) = self.rx.recv().await {
-            println!("Received fetch request for URL: {}", request.url);
-            let client = self.client.clone();
-            let tx = self.tx.clone();
-            let url = request.url.clone();
-            let config = self.config.clone();
+        while let Ok(event) = self.receiver.recv().await {
+            match event {
+                EventType::FetcherRequest(fetcher_request) => {
+                    match fetcher_request {
+                        FetcherRequest::Categories(request_url) => {
+                            let client = self.client.clone();
+                            let sender = self.sender.clone();
+                            let url = request_url.url.clone();
+                            let config = self.config.clone();
 
-            task::spawn(async move {
-                println!("Spawning task to fetch data from URL: {}", url);
-                let response = Fetcher::fetch_data(&client, &config, &url).await;
-                match response {
-                    Ok(data) => {
-                        println!("Data fetched successfully, parsing...");
-                        if let Ok(categories_response) =
-                            serde_json::from_str::<CategoriesResponse>(&data)
-                        {
-                            println!("Data parsed successfully, sending response...");
-                            if tx
-                                .send(FetchResponse::Categories(categories_response))
-                                .await
-                                .is_err()
-                            {
-                                eprintln!("Failed to send categories response");
-                            }
-                        } else {
-                            eprintln!("Response did not match expected CategoriesResponse");
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Failed to fetch data: {}", e);
-                        if tx
-                            .send(FetchResponse::FetchFailed { error: error_msg })
-                            .await
-                            .is_err()
-                        {
-                            eprintln!("Failed to send fetch failure response");
-                        }
+                            let _ = sender.send(EventType::IncrementActive);
+                            task::spawn(async move {
+                                let response = Fetcher::fetch_data(&client, &config, &url).await;
+                                match response {
+                                    Ok(data) => {
+                                        match serde_json::from_str::<CategoriesResponse>(&data) {
+                                        Ok(categories_response) => {
+                                            let response_event = EventType::FetcherResponse(
+                                                FetcherResponse::Categories(categories_response)
+                                            );
+                                            if sender.send(response_event).is_err() {
+                                                eprintln!("Failed to send categories response");
+                                            }
+                                        },
+                                        Err(_) => eprintln!("Response did not match expected CategoriesResponse")
+                                    }
+                                    }
+                                    Err(e) => {
+                                        let error_msg = format!("Failed to fetch data: {}", e);
+                                        let failure_event = EventType::FetcherResponse(
+                                            FetcherResponse::FetchFailed { error: error_msg },
+                                        );
+                                        if sender.send(failure_event).is_err() {
+                                            eprintln!("Failed to send fetch failure response");
+                                        }
+                                    }
+                                }
+                                let _ = sender.send(EventType::DecrementActive);
+                            });
+                        } // Handle other fetcher requests similarly
                     }
                 }
-            });
+                _ => {} // Handle other event types or ignore
+            }
         }
     }
 
@@ -166,7 +194,6 @@ impl Fetcher {
         config: &FetcherConfig,
         url: &str,
     ) -> Result<String, ReqwestError> {
-        println!("Fetching data from endpoint: {}", url);
         let endpoint = format!(
             "{}/api/v2/help_center/{}/{}",
             config.base_url, config.language, url
@@ -180,12 +207,47 @@ impl Fetcher {
 
         if response.status().is_success() {
             let data = response.text().await?;
-            println!("Data successfully retrieved from: {}", url);
             Ok(data)
         } else {
-            let err = format!("HTTP Error: {}", response.status());
-            println!("{}", err);
             Err(ReqwestError::from(response.error_for_status().unwrap_err()))
+        }
+    }
+}
+
+struct AppState {
+    active_count: AtomicUsize,
+    tx: broadcast::Sender<EventType>,
+    rx: broadcast::Receiver<EventType>,
+}
+
+impl AppState {
+    fn new(tx: broadcast::Sender<EventType>, rx: broadcast::Receiver<EventType>) -> Self {
+        AppState {
+            active_count: AtomicUsize::new(0),
+            tx,
+            rx,
+        }
+    }
+
+    async fn monitor_state(&mut self) {
+        while let Ok(update) = self.rx.recv().await {
+            match update {
+                EventType::IncrementActive => {
+                    self.active_count.fetch_add(1, Ordering::SeqCst);
+                }
+                EventType::DecrementActive => {
+                    self.active_count.fetch_sub(1, Ordering::SeqCst);
+                }
+                _ => {} // Handle other EventType variants if necessary
+            }
+            // Check the current active count after update
+            let current_active_count = self.active_count.load(Ordering::SeqCst);
+            println!("Current active tasks: {}", current_active_count);
+
+            // If the active count is zero, print "no more active tasks"
+            if current_active_count == 0 {
+                println!("No more active tasks.");
+            }
         }
     }
 }
@@ -193,9 +255,8 @@ impl Fetcher {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Setup channel communications
-    let (fetcher_tx, fetcher_rx) = mpsc::channel(32);
-    let (categories_tx, categories_rx) = mpsc::channel(32);
-
+    let (tx, _) = broadcast::channel::<EventType>(100);
+    //
     // Configuration from environment variables
     let config = FetcherConfig {
         email: env::var("ZENDESK_EMAIL")?,
@@ -204,12 +265,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         language: "en-001".to_string(),
     };
 
-    // Initialize Fetcher and Categories
-    let mut fetcher = Fetcher::new(config.clone(), fetcher_rx, categories_tx.clone());
-    let mut categories = Categories::new(fetcher_tx, categories_rx);
+    let mut app_state = AppState::new(tx.clone(), tx.subscribe());
+    let mut fetcher = Fetcher::new(config, tx.clone(), tx.subscribe());
+    let mut categories = Categories::new(tx.clone(), tx.subscribe());
 
-    println!("Starting Fetcher and Categories...");
-    // Run Fetcher and Categories concurrently
+    let state_handle = tokio::spawn(async move {
+        app_state.monitor_state().await;
+    });
+
     let fetcher_handle = tokio::spawn(async move {
         fetcher.run().await;
     });
@@ -218,9 +281,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         categories.run().await;
     });
 
-    // Wait for both tasks to complete
-    let _ = tokio::try_join!(fetcher_handle, categories_handle)?;
+    let _ = tokio::try_join!(state_handle, fetcher_handle, categories_handle)?;
 
-    println!("All tasks completed.");
     Ok(())
 }
