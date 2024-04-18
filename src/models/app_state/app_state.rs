@@ -45,7 +45,6 @@ impl AppState {
 
     pub async fn monitor_state(&mut self) {
         while let Ok(update) = self.rx.recv().await {
-            println!("Received update: {:?}", update);
             match update {
                 EventType::UpdateState(state_update) => match state_update {
                     StateUpdate::Categories(count_action) => {

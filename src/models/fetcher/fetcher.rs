@@ -1,8 +1,7 @@
-use reqwest::{Client, Error as ReqwestError};
-use tokio::{sync::broadcast, task};
-
 use crate::events::{ActiveCount, EventType, FetcherRequest, FetcherResponse, StateUpdate};
 use crate::models::categories::CategoriesResponse;
+use reqwest::{Client, Error as ReqwestError};
+use tokio::sync::broadcast;
 
 pub struct Fetcher {
     client: Client,
@@ -37,52 +36,45 @@ impl Fetcher {
         while let Ok(event) = self.receiver.recv().await {
             match event {
                 EventType::FetcherRequest(fetcher_request) => {
-                    match fetcher_request {
-                        FetcherRequest::Categories(request_url) => {
-                            let client = self.client.clone();
-                            let sender = self.sender.clone();
-                            let url = request_url.url.clone();
-                            let config = self.config.clone();
-
-                            let _ = sender.send(EventType::UpdateState(StateUpdate::Fetcher(
-                                ActiveCount::Increment,
-                            )));
-                            task::spawn(async move {
-                                let response = Fetcher::fetch_data(&client, &config, &url).await;
-                                match response {
-                                    Ok(data) => {
-                                        match serde_json::from_str::<CategoriesResponse>(&data) {
-                                            Ok(categories_response) => {
-                                                let response_event = EventType::FetcherResponse(
-                                                    FetcherResponse::Categories(categories_response)
-                                                );
-                                                if sender.send(response_event).is_err() {
-                                                    eprintln!("Failed to send categories response");
-                                                }
-                                            },
-                                            Err(_) => eprintln!("Response did not match expected CategoriesResponse")
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let error_msg = format!("Failed to fetch data: {}", e);
-                                        let failure_event = EventType::FetcherResponse(
-                                            FetcherResponse::FetchFailed { error: error_msg },
-                                        );
-                                        if sender.send(failure_event).is_err() {
-                                            eprintln!("Failed to send fetch failure response");
-                                        }
-                                    }
-                                }
-                                let _ = sender.send(EventType::UpdateState(StateUpdate::Fetcher(
-                                    ActiveCount::Decrement,
-                                )));
-                            });
-                        } // Handle other fetcher requests similarly
+                    let _ = self
+                        .sender
+                        .send(EventType::UpdateState(StateUpdate::Fetcher(
+                            ActiveCount::Increment,
+                        )));
+                    let response = self.handle_request(fetcher_request).await;
+                    if let Err(e) = self.sender.send(response) {
+                        eprintln!("Failed to communicate with event system: {}", e);
                     }
+                    let _ = self
+                        .sender
+                        .send(EventType::UpdateState(StateUpdate::Fetcher(
+                            ActiveCount::Decrement,
+                        )));
                 }
                 EventType::Shutdown => break,
                 _ => {} // Handle other event types or ignore
             }
+        }
+    }
+
+    async fn handle_request(&self, fetcher_request: FetcherRequest) -> EventType {
+        match fetcher_request {
+            FetcherRequest::Categories(request_url) => {
+                let url = request_url.url;
+                match Fetcher::fetch_data(&self.client, &self.config, &url).await {
+                    Ok(data) => match serde_json::from_str::<CategoriesResponse>(&data) {
+                        Ok(categories_response) => EventType::FetcherResponse(
+                            FetcherResponse::Categories(categories_response),
+                        ),
+                        Err(_) => EventType::FetcherResponse(FetcherResponse::FetchFailed {
+                            error: "Invalid response format".to_string(),
+                        }),
+                    },
+                    Err(e) => EventType::FetcherResponse(FetcherResponse::FetchFailed {
+                        error: format!("Failed to fetch data: {}", e),
+                    }),
+                }
+            } // Add other FetcherRequest cases here
         }
     }
 
@@ -102,11 +94,6 @@ impl Fetcher {
             .send()
             .await?;
 
-        if response.status().is_success() {
-            let data = response.text().await?;
-            Ok(data)
-        } else {
-            Err(ReqwestError::from(response.error_for_status().unwrap_err()))
-        }
+        response.text().await.map_err(ReqwestError::from)
     }
 }

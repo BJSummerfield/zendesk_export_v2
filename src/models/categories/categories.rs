@@ -1,21 +1,15 @@
 use rayon::prelude::*;
 use serde::Deserialize;
-use std::collections::HashMap;
 use tokio::sync::broadcast;
 
 use crate::events::{
-    ActiveCount, EventType, FetcherRequest, FetcherResponse, RequestUrl, StateUpdate,
+    ActiveCount, EventType, FetcherRequest, FetcherResponse, FileRequest, RequestUrl, StateUpdate,
 };
+use crate::utils::Utils;
 
 #[derive(Deserialize, Debug, Clone)]
 struct Category {
     id: i64,
-    name: String,
-    url: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct CategoryDetail {
     name: String,
     url: String,
 }
@@ -28,7 +22,6 @@ pub struct CategoriesResponse {
 
 #[derive(Debug)]
 pub struct Categories {
-    categories_hash: HashMap<i64, CategoryDetail>,
     sender: broadcast::Sender<EventType>,
     receiver: broadcast::Receiver<EventType>,
 }
@@ -38,70 +31,66 @@ impl Categories {
         sender: broadcast::Sender<EventType>,
         receiver: broadcast::Receiver<EventType>,
     ) -> Self {
-        Categories {
-            categories_hash: HashMap::new(),
-            sender,
-            receiver,
-        }
-    }
-
-    pub fn print_categories(&self) {
-        for (id, category) in &self.categories_hash {
-            println!("ID: {}, Name: {}, URL: {}", id, category.name, category.url);
-        }
+        Categories { sender, receiver }
     }
 
     pub async fn run(&mut self) {
         let initial_url = "categories.json".to_string();
         let request = FetcherRequest::Categories(RequestUrl { url: initial_url });
+        let _ = self.sender.send(EventType::FetcherRequest(request));
 
-        // Send the initial request
-        let _ = self.sender.send(EventType::FetcherRequest(request)); // Ignoring errors, which occur if no subscribers are present
-
-        // Receive responses and handle shutdown
         while let Ok(message) = self.receiver.recv().await {
             match message {
                 EventType::FetcherResponse(response) => {
-                    match response {
-                        FetcherResponse::Categories(res) => {
-                            // Increment active count before processing
-                            println!("{}", res.next_page.unwrap_or("None".to_string()));
-                            let _ =
-                                self.sender
-                                    .send(EventType::UpdateState(StateUpdate::Categories(
-                                        ActiveCount::Increment,
-                                    )));
-
-                            // Process categories
-                            self.categories_hash
-                                .par_extend(res.categories.into_par_iter().map(|cat| {
-                                    (
-                                        cat.id,
-                                        CategoryDetail {
-                                            name: cat.name,
-                                            url: cat.url,
-                                        },
-                                    )
-                                }));
-
-                            // Decrement active count after processing
-                            let _ =
-                                self.sender
-                                    .send(EventType::UpdateState(StateUpdate::Categories(
-                                        ActiveCount::Decrement,
-                                    )));
-                        }
-                        FetcherResponse::FetchFailed { error } => {
-                            eprintln!("Fetch failed: {}", error);
-                        }
-                    }
-                    self.print_categories();
+                    self.process_response(response).await;
                 }
                 EventType::Shutdown => {
                     println!("Categories service is shutting down.");
-                    break; // Exit the loop and end the task
+                    break;
                 }
-                _ => {} // Ignore other event types
+                _ => {}
+            }
+        }
+    }
+
+    async fn process_response(&mut self, response: FetcherResponse) {
+        match response {
+            FetcherResponse::Categories(res) => {
+                let _ = self
+                    .sender
+                    .send(EventType::UpdateState(StateUpdate::Categories(
+                        ActiveCount::Increment,
+                    )));
+
+                // Handle pagination
+                if let Some(next_page) = res.next_page {
+                    let next_page_url = next_page.split('/').last().unwrap_or("").to_string();
+                    let request = FetcherRequest::Categories(RequestUrl { url: next_page_url });
+                    let _ = self.sender.send(EventType::FetcherRequest(request));
+                }
+
+                res.categories.into_par_iter().for_each(|cat| {
+                    let sanitized_name = Utils::sanitize_name(&cat.name);
+                    let front_matter = Utils::create_front_matter(&cat.name);
+                    let path = format!("{}/_index.md", sanitized_name);
+
+                    // Send the file write request
+                    let _ = self
+                        .sender
+                        .send(EventType::FileRequest(FileRequest::Markdown {
+                            path,
+                            data: front_matter,
+                        }));
+                });
+
+                let _ = self
+                    .sender
+                    .send(EventType::UpdateState(StateUpdate::Categories(
+                        ActiveCount::Decrement,
+                    )));
+            }
+            FetcherResponse::FetchFailed { error } => {
+                eprintln!("Fetch failed: {}", error);
             }
         }
     }
