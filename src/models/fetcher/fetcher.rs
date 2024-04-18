@@ -51,7 +51,10 @@ impl Fetcher {
                             ActiveCount::Decrement,
                         )));
                 }
-                EventType::Shutdown => break,
+                EventType::Shutdown => {
+                    println!("Fetcher service is shutting down.");
+                    break;
+                }
                 _ => {} // Handle other event types or ignore
             }
         }

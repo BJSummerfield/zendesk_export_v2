@@ -59,7 +59,10 @@ impl AppState {
                             .await;
                     }
                 },
-                EventType::Shutdown => break,
+                EventType::Shutdown => {
+                    println!("AppState service is shutting down.");
+                    break;
+                }
                 _ => {} // Handle other EventType variants if necessary
             }
             if self.check_all_services_inactive().await {

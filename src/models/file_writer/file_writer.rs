@@ -45,7 +45,10 @@ impl FileWriter {
                             ActiveCount::Decrement,
                         )));
                 }
-                EventType::Shutdown => break,
+                EventType::Shutdown => {
+                    println!("FileWriter service is shutting down.");
+                    break;
+                }
                 _ => {} // Handle other EventType variants if necessary
             }
         }
